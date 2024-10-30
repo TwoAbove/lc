@@ -1,7 +1,7 @@
 # lc
 A CLI tool that generates snapshots of codebases for use with Large Language Models (LLMs), featuring multi-codebase support, token management, and clipboard integration.
 
-A tool for generating representations of codebases for Large Language Models (LLMs). lc creates a structured XML-like document containing your codebase's files and directories, making it easy to share code context with AI assistants while respecting `.gitignore` patterns and handling multiple codebases.
+lc creates a structured XML-like document containing your codebase's files and directories, making it easy to share code context with AI assistants while respecting `.gitignore` patterns and handling multiple codebases.
 
 ## Features
 

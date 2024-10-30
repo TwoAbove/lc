@@ -3,7 +3,6 @@
 # /// script
 # dependencies = [
 #   "pyperclip",
-#   "lxml",
 #   "colorama",
 #   "tiktoken",
 #   "pathspec"
@@ -12,24 +11,23 @@
 
 import os
 import sys
+import re
 import pyperclip
 import argparse
 import tiktoken
 from pathlib import Path
 from typing import Set, List, Dict, Any, Optional, Tuple
-from lxml import etree
 from colorama import init, Fore, Style
 from pathspec import PathSpec
 from pathspec.patterns import GitWildMatchPattern
 
-# Initialize colorama
 init(autoreset=True)
 
 INSTRUCTIONS_TEXT = """
-This XML document contains a representation of one or more codebases.
-Each codebase is enclosed in a <codebase> tag with a 'path' attribute.
+This document contains a representation of one or more codebases.
+Each codebase is enclosed in <codebase> tags with a 'path' attribute.
 Files are represented by <file> tags with the 'path' attribute.
-File contents are stored as CDATA within the <file> tags.
+File contents are stored within the <file> tags.
 For directory-only mode, <directory> tags are used instead of <file> tags.
 """
 
@@ -98,11 +96,121 @@ BINARY_EXTENSIONS = {
 
 
 class TokenCounter:
-    def __init__(self, model_name: str = "cl100k_base"):
+    def __init__(self, model_name: str = "o200k_base"):
         self.encoder = tiktoken.get_encoding(model_name)
 
     def count_tokens(self, text: str) -> int:
         return len(self.encoder.encode(text))
+
+
+class LCDocument:
+    def __init__(self):
+        self.codebases = []
+        self.instructions = INSTRUCTIONS_TEXT.strip()
+
+    def add_or_update_codebase(self, codebase):
+        for i, existing in enumerate(self.codebases):
+            if existing.path == codebase.path:
+                self.codebases[i] = codebase
+                return
+        self.codebases.append(codebase)
+
+    def to_string(self) -> str:
+        lines = []
+        lines.append("<lc>")
+        lines.append("<instructions>")
+        lines.append(self.instructions)
+        lines.append("</instructions>")
+
+        for codebase in self.codebases:
+            lines.append(codebase.to_string())
+
+        lines.append("</lc>")
+        return "\n".join(lines)
+
+    @classmethod
+    def from_string(cls, content: str) -> Optional["LCDocument"]:
+        if not content or "<lc>" not in content:
+            return None
+
+        doc = cls()
+
+        # Extract instructions if present
+        instructions_match = re.search(
+            r"<instructions>(.*?)</instructions>", content, re.DOTALL
+        )
+        if instructions_match:
+            doc.instructions = instructions_match.group(1).strip()
+
+        # Extract codebases
+        codebase_pattern = r'<codebase\s+path="([^"]+)">(.*?)</codebase>'
+        for match in re.finditer(codebase_pattern, content, re.DOTALL):
+            path = match.group(1)
+            codebase_content = match.group(2)
+            codebase = Codebase.from_string(path, codebase_content)
+            doc.codebases.append(codebase)
+
+        return doc
+
+
+class Codebase:
+    def __init__(self, path: str):
+        self.path = path
+        self.entries = []  # List[FileEntry or DirectoryEntry]
+
+    def add_entry(self, entry):
+        self.entries.append(entry)
+
+    def to_string(self) -> str:
+        lines = []
+        lines.append(f'<codebase path="{self.path}">')
+        for entry in self.entries:
+            lines.append(entry.to_string())
+        lines.append("</codebase>")
+        return "\n".join(lines)
+
+    @classmethod
+    def from_string(cls, path: str, content: str) -> "Codebase":
+        codebase = cls(path)
+
+        # Extract files
+        file_pattern = r'<file\s+path="([^"]+)"\s+tokens="(\d+)">(.*?)</file>'
+        for match in re.finditer(file_pattern, content, re.DOTALL):
+            file_path = match.group(1)
+            tokens = int(match.group(2))
+            file_content = match.group(3)
+            entry = FileEntry(file_path, file_content, tokens)
+            codebase.add_entry(entry)
+
+        # Extract directories
+        dir_pattern = r'<directory\s+path="([^"]+)"\s+tokens="(\d+)".*?</directory>'
+        for match in re.finditer(dir_pattern, content):
+            dir_path = match.group(1)
+            tokens = int(match.group(2))
+            entry = DirectoryEntry(dir_path, tokens)
+            codebase.add_entry(entry)
+
+        return codebase
+
+
+class FileEntry:
+    def __init__(self, path: str, content: str, tokens: int):
+        self.path = path
+        self.content = content
+        self.tokens = tokens
+        self.lines = len(content.splitlines()) if content else 0
+
+    def to_string(self) -> str:
+        return f'<file path="{self.path}" tokens="{self.tokens}">{self.content}</file>'
+
+
+class DirectoryEntry:
+    def __init__(self, path: str, tokens: int = 0):
+        self.path = path
+        self.tokens = tokens
+
+    def to_string(self) -> str:
+        return f'<directory path="{self.path}" tokens="{self.tokens}"></directory>'
 
 
 class CodebaseTraverser:
@@ -125,7 +233,6 @@ class CodebaseTraverser:
         for root, dirs, files in os.walk(str(self.directory), followlinks=True):
             rel_root = Path(root).relative_to(self.directory)
 
-            # Process directories
             for dir_name in dirs[:]:
                 dir_path = rel_root / dir_name
                 if self.pathspec.match_file(str(dir_path)):
@@ -135,7 +242,6 @@ class CodebaseTraverser:
                         {"path": str(dir_path), "content": "", "lines": 0, "tokens": 0}
                     )
 
-            # Process files
             if not self.directory_only:
                 for file_name in files:
                     file_path = rel_root / file_name
@@ -152,36 +258,23 @@ class CodebaseTraverser:
 
         return codebase
 
-    def _should_ignore(self, file_path: str) -> bool:
-        return self.pathspec.match_file(file_path)
-
     def _is_binary_file(self, file_path: str) -> bool:
         return file_path.lower().endswith(tuple(BINARY_EXTENSIONS))
 
     def _process_file(self, item: Path, file_info: Dict[str, Any]):
         if self._is_binary_file(str(item)):
             file_info["content"] = "[Binary file]"
-            file_info["tokens"] = 2  # Count "[Binary file]" as 2 tokens
+            file_info["tokens"] = 2
         else:
             try:
                 with open(item, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
-                    try:
-                        etree.CDATA(content)
-                        file_info["content"] = content
-                        file_info["lines"] = len(content.splitlines())
-                        file_info["tokens"] = self.token_counter.count_tokens(content)
+                    file_info["content"] = content
+                    file_info["lines"] = len(content.splitlines())
+                    file_info["tokens"] = self.token_counter.count_tokens(content)
 
-                        if self.token_limit and file_info["tokens"] > self.token_limit:
-                            self.large_files.append((str(item), file_info["tokens"]))
-
-                    except ValueError as e:
-                        print(
-                            f"{Fore.RED}XML incompatible characters in file: {Fore.YELLOW}{item}{Style.RESET_ALL}"
-                        )
-                        file_info["content"] = "[Binary file]"
-                        file_info["lines"] = 0
-                        file_info["tokens"] = 2
+                    if self.token_limit and file_info["tokens"] > self.token_limit:
+                        self.large_files.append((str(item), file_info["tokens"]))
             except Exception as e:
                 print(f"Error reading file {item}: {e}", file=sys.stderr)
                 file_info["content"] = f"Error reading file: {e}"
@@ -190,74 +283,24 @@ class CodebaseTraverser:
                 )
 
 
-class XMLGenerator:
+class SimpleGenerator:
     @staticmethod
     def generate(
-        codebase: List[Dict[str, Any]], pwd: str, directory_only: bool
-    ) -> etree.Element:
-        try:
-            root = etree.Element("lc")
-            XMLGenerator._add_instructions(root)
-            codebase_elem = etree.SubElement(root, "codebase", path=pwd)
+        codebase_entries: List[Dict[str, Any]], pwd: str, directory_only: bool
+    ) -> str:
+        codebase = Codebase(pwd)
 
-            for file_info in codebase:
-                XMLGenerator._add_file_or_directory(
-                    codebase_elem, file_info, directory_only
+        for entry in codebase_entries:
+            if directory_only:
+                codebase.add_entry(DirectoryEntry(entry["path"], entry["tokens"]))
+            else:
+                codebase.add_entry(
+                    FileEntry(entry["path"], entry["content"], entry["tokens"])
                 )
 
-            return root
-        except Exception as e:
-            print(f"Error generating XML: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    @staticmethod
-    def _add_instructions(root: etree.Element):
-        instructions = etree.SubElement(root, "instructions")
-        instructions.text = etree.CDATA(INSTRUCTIONS_TEXT)
-
-    @staticmethod
-    def _add_file_or_directory(
-        parent: etree.Element, file_info: Dict[str, Any], directory_only: bool
-    ):
-        elem_type = "directory" if directory_only else "file"
-        file_elem = etree.SubElement(
-            parent, elem_type, path=file_info["path"], tokens=str(file_info["tokens"])
-        )
-        if not directory_only and file_info["content"]:
-            file_elem.text = etree.CDATA(f"\n{file_info['content']}\n")
-
-
-class XMLManager:
-    @staticmethod
-    def update_or_add_codebase(
-        existing_xml: str, new_codebase: etree.Element
-    ) -> etree.Element:
-        root = None
-        try:
-            # Try parsing as bytes first
-            root = etree.fromstring(existing_xml.encode("utf-8"))
-        except etree.XMLSyntaxError:
-            try:
-                # If that fails, try parsing as a string without encoding declaration
-                root = etree.fromstring(
-                    existing_xml.encode("utf-8"), parser=etree.XMLParser(recover=True)
-                )
-            except etree.XMLSyntaxError:
-                # If both fail, create a new root element
-                pass
-
-        if root is None or root.find(".//instructions") is None:
-            root = etree.Element("lc")
-            XMLGenerator._add_instructions(root)
-
-        new_pwd = new_codebase.find("codebase").get("path")
-        existing_codebase = root.find(f".//codebase[@path='{new_pwd}']")
-
-        if existing_codebase is not None:
-            root.remove(existing_codebase)
-        root.append(new_codebase.find("codebase"))
-
-        return root
+        doc = LCDocument()
+        doc.add_or_update_codebase(codebase)
+        return doc.to_string()
 
 
 def find_git_root(start_path: Path) -> Optional[Path]:
@@ -276,7 +319,6 @@ def parse_ignore_file(file_path: Path) -> Set[str]:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    # Ensure patterns starting with / are relative to repo root
                     if line.startswith("/"):
                         line = line[1:]
                     ignore_patterns.add(line)
@@ -296,36 +338,40 @@ def get_ignore_patterns(base_directory: Path, git_root: Optional[Path]) -> Set[s
     return ignore_patterns
 
 
-def get_codebase_stats(codebase: etree.Element, directory_only: bool) -> Dict[str, Any]:
-    files = codebase.findall(".//file" if not directory_only else ".//directory")
-    total_tokens = sum(int(file.get("tokens", 0)) for file in files)
+def get_stats_from_content(content: str, directory_only: bool) -> Dict[str, Any]:
+    doc = LCDocument.from_string(content)
+    if not doc:
+        return {"files": 0, "tokens": 0, "lines": 0}
 
-    stats = {
-        "files" if not directory_only else "directories": len(files),
-        "lines": (
-            sum(int(file.get("lines", 0)) for file in codebase.findall(".//file"))
-            if not directory_only
-            else 0
-        ),
+    total_files = 0
+    total_tokens = 0
+    total_lines = 0
+
+    for codebase in doc.codebases:
+        for entry in codebase.entries:
+            total_files += 1
+            total_tokens += entry.tokens
+            if isinstance(entry, FileEntry):
+                total_lines += entry.lines
+
+    return {
+        "files": total_files,
         "tokens": total_tokens,
+        "lines": total_lines if not directory_only else 0,
     }
-    return stats
 
 
-def print_all_codebase_stats(
-    root: etree.Element, directory_only: bool, large_files: List[Tuple[str, int]]
-):
-    for codebase in root.findall(".//codebase"):
-        stats = get_codebase_stats(codebase, directory_only)
-        print(f"{Fore.CYAN}{Style.BRIGHT}{codebase.get('path')}{Style.RESET_ALL}")
-        if directory_only:
-            print(f"d: {Fore.GREEN}{stats['directories']}{Style.RESET_ALL}")
-        else:
-            print(
-                f"f: {Fore.GREEN}{stats['files']}{Style.RESET_ALL} "
-                f"l: {Fore.YELLOW}{stats['lines']}{Style.RESET_ALL} "
-                f"t: {Fore.MAGENTA}{stats['tokens']}{Style.RESET_ALL}"
-            )
+def print_stats(content: str, directory_only: bool, large_files: List[Tuple[str, int]]):
+    stats = get_stats_from_content(content, directory_only)
+
+    if directory_only:
+        print(f"d: {Fore.GREEN}{stats['files']}{Style.RESET_ALL}")
+    else:
+        print(
+            f"f: {Fore.GREEN}{stats['files']}{Style.RESET_ALL} "
+            f"l: {Fore.YELLOW}{stats['lines']}{Style.RESET_ALL} "
+            f"t: {Fore.MAGENTA}{stats['tokens']}{Style.RESET_ALL}"
+        )
 
     if large_files:
         print(f"\n{Fore.RED}Files exceeding token limit:{Style.RESET_ALL}")
@@ -335,17 +381,9 @@ def print_all_codebase_stats(
             )
 
 
-def generate_final_xml(root: etree.Element) -> str:
-    # Generate XML string without declaration
-    xml_string = etree.tostring(root, encoding="unicode", pretty_print=True)
-
-    # Manually add XML declaration
-    return f'<?xml version="1.0" encoding="UTF-8"?>\n{xml_string}'
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate XML from directory structure with dense output for multiple codebases."
+        description="Generate structured output from directory for multiple codebases."
     )
     parser.add_argument(
         "subfolder",
@@ -357,7 +395,7 @@ def main():
         "-d",
         "--directory-only",
         action="store_true",
-        help="Output only the directory structure without file contents",
+        help="Output only directory structure without file contents",
     )
     parser.add_argument(
         "-t",
@@ -381,23 +419,34 @@ def main():
     traverser = CodebaseTraverser(
         directory_path, ignore_patterns, args.directory_only, args.token_limit
     )
-    codebase = traverser.traverse()
+    codebase_entries = traverser.traverse()
 
-    new_codebase_xml = XMLGenerator.generate(
-        codebase, str(directory_path), args.directory_only
+    # Generate new codebase content
+    new_content = SimpleGenerator.generate(
+        codebase_entries, str(directory_path), args.directory_only
     )
 
+    # Get existing clipboard content and parse it if it's an LC document
     clipboard_content = pyperclip.paste()
-    updated_xml_root = XMLManager.update_or_add_codebase(
-        clipboard_content, new_codebase_xml
-    )
+    existing_doc = LCDocument.from_string(clipboard_content)
 
-    print_all_codebase_stats(
-        updated_xml_root, args.directory_only, traverser.large_files
-    )
+    if existing_doc:
+        # Parse the new content as a document
+        new_doc = LCDocument.from_string(new_content)
+        if new_doc and new_doc.codebases:
+            # Update or add the new codebase
+            existing_doc.add_or_update_codebase(new_doc.codebases[0])
+            final_content = existing_doc.to_string()
+        else:
+            final_content = new_content
+    else:
+        final_content = new_content
 
-    final_xml = generate_final_xml(updated_xml_root)
-    pyperclip.copy(final_xml)
+    # Print statistics
+    print_stats(final_content, args.directory_only, traverser.large_files)
+
+    # Update clipboard
+    pyperclip.copy(final_content)
 
 
 if __name__ == "__main__":

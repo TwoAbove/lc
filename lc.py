@@ -334,6 +334,9 @@ def get_ignore_patterns(base_directory: Path, git_root: Optional[Path]) -> Set[s
         ignore_patterns.update(parse_ignore_file(base_directory / ".gitignore"))
         ignore_patterns.update(parse_ignore_file(base_directory / ".repoignore"))
 
+    # Also add home dir repoignore
+    ignore_patterns.update(parse_ignore_file(Path.home() / ".repoignore"))
+
     ignore_patterns.update({".git", ".repo", "package-lock.json", "yarn.lock"})
     return ignore_patterns
 

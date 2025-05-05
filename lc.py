@@ -1,20 +1,23 @@
-#!/usr/bin/env -S uv run
-
+#!/usr/bin/env -S uv --quiet run --script
 # /// script
 # dependencies = [
 #   "pyperclip",
 #   "colorama",
 #   "tiktoken",
-#   "pathspec"
+#   "pathspec",
+#   "openai"
 # ]
 # ///
 
 import os
+import json
+import openai
 import sys
 import re
 import pyperclip
 import argparse
 import tiktoken
+from sys import platform
 from pathlib import Path
 from typing import Set, List, Dict, Any, Optional, Tuple
 from colorama import init, Fore, Style
@@ -32,7 +35,7 @@ For directory-only mode, <directory> tags are used instead of <file> tags.
 """
 
 BINARY_EXTENSIONS = {
-    "wasm",
+    ".wasm",
     ".png",
     ".jpg",
     ".jpeg",
@@ -42,6 +45,9 @@ BINARY_EXTENSIONS = {
     ".svg",
     ".webp",
     ".tiff",
+    '.tff',
+    '.woff',
+    '.woff2',
     ".tif",
     ".psd",
     ".raw",
@@ -60,6 +66,7 @@ BINARY_EXTENSIONS = {
     ".wma",
     ".ogg",
     ".mp4",
+    '.m4a',
     ".mkv",
     ".webm",
     ".avi",
@@ -100,7 +107,10 @@ class TokenCounter:
         self.encoder = tiktoken.get_encoding(model_name)
 
     def count_tokens(self, text: str) -> int:
-        return len(self.encoder.encode(text))
+        try:
+            return len(self.encoder.encode(text))
+        except Exception:
+            return -1
 
 
 class LCDocument:
@@ -227,6 +237,8 @@ class CodebaseTraverser:
         self.token_counter = TokenCounter()
         self.token_limit = token_limit
         self.large_files: List[Tuple[str, int]] = []
+        self.has_token_errors = False
+        self.files_with_token_errors: List[str] = []
 
     def traverse(self) -> List[Dict[str, Any]]:
         codebase = []
@@ -271,16 +283,26 @@ class CodebaseTraverser:
                     content = f.read()
                     file_info["content"] = content
                     file_info["lines"] = len(content.splitlines())
-                    file_info["tokens"] = self.token_counter.count_tokens(content)
 
-                    if self.token_limit and file_info["tokens"] > self.token_limit:
-                        self.large_files.append((str(item), file_info["tokens"]))
+                    token_count = self.token_counter.count_tokens(content)
+                    if token_count == -1:
+                        self.has_token_errors = True
+                        self.files_with_token_errors.append(str(item))
+                        file_info["tokens"] = 0
+                    else:
+                        file_info["tokens"] = token_count
+                        if self.token_limit and token_count > self.token_limit:
+                            self.large_files.append((str(item), token_count))
             except Exception as e:
                 print(f"Error reading file {item}: {e}", file=sys.stderr)
                 file_info["content"] = f"Error reading file: {e}"
-                file_info["tokens"] = self.token_counter.count_tokens(
-                    file_info["content"]
-                )
+                token_count = self.token_counter.count_tokens(file_info["content"])
+                if token_count == -1:
+                    self.has_token_errors = True
+                    self.files_with_token_errors.append(str(item))
+                    file_info["tokens"] = 0
+                else:
+                    file_info["tokens"] = token_count
 
 
 class SimpleGenerator:
@@ -344,11 +366,12 @@ def get_ignore_patterns(base_directory: Path, git_root: Optional[Path]) -> Set[s
 def get_stats_from_content(content: str, directory_only: bool) -> Dict[str, Any]:
     doc = LCDocument.from_string(content)
     if not doc:
-        return {"files": 0, "tokens": 0, "lines": 0}
+        return {"files": 0, "tokens": 0, "lines": 0, "has_token_errors": False}
 
     total_files = 0
     total_tokens = 0
     total_lines = 0
+    has_token_errors = False
 
     for codebase in doc.codebases:
         for entry in codebase.entries:
@@ -361,21 +384,102 @@ def get_stats_from_content(content: str, directory_only: bool) -> Dict[str, Any]
         "files": total_files,
         "tokens": total_tokens,
         "lines": total_lines if not directory_only else 0,
+        "has_token_errors": has_token_errors
     }
 
 
-def print_stats(content: str, directory_only: bool, large_files: List[Tuple[str, int]]):
-    stats = get_stats_from_content(content, directory_only)
+class Config:
+    DEFAULT_MODEL = "openai/gpt-4.1"
+    DEFAULT_TEMPERATURE = 0.7
+    DEFAULT_TOKEN_LIMIT = 10000
 
+    @classmethod
+    def get_api_key(cls) -> str:
+        return os.getenv("OPENROUTER_API_KEY", "")
+
+    @classmethod
+    def get_api_base_url(cls) -> str:
+        return os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
+
+def get_openai_client() -> openai.OpenAI:
+    """Return configured OpenAI client."""
+    return openai.OpenAI(
+        base_url=Config.get_api_base_url(),
+        api_key=Config.get_api_key()
+    )
+
+
+def generate_command(prompt: str) -> str:
+    """
+    Generate a shell command using OpenAI's API based on the given prompt.
+    """
+    system_prompt = f"""You are an expert in writing terminal commands. Your task is to convert natural language requests into shell commands.
+Rules:
+1. Only return the command itself, no explanations or comments
+2. Use common Unix/Linux commands - the user us running {platform}
+3. Ensure the command is safe and won't cause damage. If the command could be dangerous, return 'echo "Unsafe command"' unless the user explicitly asks for it
+4. If unsure, return 'echo "Unable to generate safe command for this request"'
+5. Don't use sudo unless explicitly requested
+6. Prefer command chaining over scripts
+7. Use relative paths when possible
+
+Example inputs/outputs:
+Input: "show all PDF files recursively"
+Output: find . -name "*.pdf"
+
+Input: "what's using port 8080"
+Output: lsof -i :8080
+
+Input: "zip all jpg files"
+Output: find . -name "*.jpg" -exec zip images.zip {"{}"} +
+"""
+
+    try:
+        client = get_openai_client()
+
+        if not Config.get_api_key():
+            return 'echo "Error: OPENROUTER_API_KEY environment variable not set"'
+
+        response = client.chat.completions.create(
+            model=Config.DEFAULT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=Config.DEFAULT_TEMPERATURE
+        )
+
+        command = response.choices[0].message.content.strip()
+        return command
+    except openai.APIError as e:
+        return f'echo "API Error: {str(e)}"'
+    except openai.APIConnectionError as e:
+        return f'echo "Connection Error: Check your network connection"'
+    except openai.RateLimitError:
+        return f'echo "Rate limit exceeded: Please try again later"'
+    except Exception as e:
+        return f'echo "Error generating command: {str(e)}"'
+
+
+def print_stats(content: str, directory_only: bool, large_files: List[Tuple[str, int]],
+                has_token_errors: bool = False, files_with_token_errors: List[str] = None):
+    stats = get_stats_from_content(content, directory_only)
+    files_with_token_errors = files_with_token_errors or []
+    has_token_errors = has_token_errors or stats.get("has_token_errors", False)
+
+    # Display summary stats based on directory_only mode
     if directory_only:
         print(f"d: {Fore.GREEN}{stats['files']}{Style.RESET_ALL}")
     else:
+        tokens_display = f"{stats['tokens']} + ???" if has_token_errors else f"{stats['tokens']}"
         print(
             f"f: {Fore.GREEN}{stats['files']}{Style.RESET_ALL} "
             f"l: {Fore.YELLOW}{stats['lines']}{Style.RESET_ALL} "
-            f"t: {Fore.MAGENTA}{stats['tokens']}{Style.RESET_ALL}"
+            f"t: {Fore.MAGENTA}{tokens_display}{Style.RESET_ALL}"
         )
 
+    # Display warnings for large files if any
     if large_files:
         print(f"\n{Fore.RED}Files exceeding token limit:{Style.RESET_ALL}")
         for file_path, token_count in large_files:
@@ -383,11 +487,40 @@ def print_stats(content: str, directory_only: bool, large_files: List[Tuple[str,
                 f"{Fore.YELLOW}{file_path}{Style.RESET_ALL}: {Fore.MAGENTA}{token_count}{Style.RESET_ALL} tokens"
             )
 
+    # Display files with token counting errors if any
+    if files_with_token_errors:
+        print(f"\n{Fore.RED}Files with failed token counts:{Style.RESET_ALL}")
+        for file_path in files_with_token_errors:
+            print(f"{Fore.YELLOW}{file_path}{Style.RESET_ALL}")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate structured output from directory for multiple codebases."
+        description="Generate structured output from directory for multiple codebases or handle command execution."
     )
+
+    # Create mutually exclusive group for main operations
+    operation_group = parser.add_mutually_exclusive_group()
+
+    # Regular codebase operation flags
+    operation_group.add_argument(
+        "-c", "--copy",
+        action="store_true",
+        help="Copy codebase representation to clipboard (default behavior)",
+    )
+
+    # Command generation/execution flags
+    operation_group.add_argument(
+        "-e", "--execute",
+        type=str,
+        help="Generate a command from the prompt and copy to clipboard",
+    )
+    operation_group.add_argument(
+        "-ee", "--execute-direct",
+        type=str,
+        help="Generate and directly execute the command",
+    )
+
+    # Other arguments
     parser.add_argument(
         "subfolder",
         nargs="?",
@@ -403,53 +536,76 @@ def main():
     parser.add_argument(
         "-t",
         "--token-limit",
-        default=10000,
+        default=Config.DEFAULT_TOKEN_LIMIT,
         type=int,
         help="Token limit per file (warns if exceeded)",
     )
     args = parser.parse_args()
 
-    base_directory = Path.cwd()
-    directory_path = (base_directory / args.subfolder).resolve()
+    if args.execute or args.execute_direct:
+        # Handle command generation/execution
+        prompt = args.execute or args.execute_direct
+        command = generate_command(prompt)
 
-    if not directory_path.exists() or not directory_path.is_dir():
-        print(f"Error: {directory_path} is not a valid directory.", file=sys.stderr)
-        sys.exit(1)
+        if args.execute_direct:
+            print(f"{Fore.YELLOW}Executing command:{Style.RESET_ALL} {command}")
+            try:
+                os.system(command)
+            except Exception as e:
+                print(f"{Fore.RED}Error executing command:{Style.RESET_ALL} {e}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(f"{Fore.GREEN}Generated command copied to clipboard:{Style.RESET_ALL} {command}")
+            pyperclip.copy(command)
+    else:
+        # Handle regular codebase operation
+        base_directory = Path.cwd()
+        directory_path = (base_directory / args.subfolder).resolve()
 
-    git_root = find_git_root(directory_path)
-    ignore_patterns = get_ignore_patterns(base_directory, git_root)
+        if not directory_path.exists() or not directory_path.is_dir():
+            print(f"Error: {directory_path} is not a valid directory.", file=sys.stderr)
+            sys.exit(1)
 
-    traverser = CodebaseTraverser(
-        directory_path, ignore_patterns, args.directory_only, args.token_limit
-    )
-    codebase_entries = traverser.traverse()
+        git_root = find_git_root(directory_path)
+        ignore_patterns = get_ignore_patterns(base_directory, git_root)
 
-    # Generate new codebase content
-    new_content = SimpleGenerator.generate(
-        codebase_entries, str(directory_path), args.directory_only
-    )
+        traverser = CodebaseTraverser(
+            directory_path, ignore_patterns, args.directory_only, args.token_limit
+        )
+        codebase_entries = traverser.traverse()
 
-    # Get existing clipboard content and parse it if it's an LC document
-    clipboard_content = pyperclip.paste()
-    existing_doc = LCDocument.from_string(clipboard_content)
+        # Generate new codebase content
+        new_content = SimpleGenerator.generate(
+            codebase_entries, str(directory_path), args.directory_only
+        )
 
-    if existing_doc:
-        # Parse the new content as a document
-        new_doc = LCDocument.from_string(new_content)
-        if new_doc and new_doc.codebases:
-            # Update or add the new codebase
-            existing_doc.add_or_update_codebase(new_doc.codebases[0])
-            final_content = existing_doc.to_string()
+        # Get existing clipboard content and parse it if it's an LC document
+        clipboard_content = pyperclip.paste()
+        existing_doc = LCDocument.from_string(clipboard_content)
+
+        if existing_doc:
+            # Parse the new content as a document
+            new_doc = LCDocument.from_string(new_content)
+            if new_doc and new_doc.codebases:
+                # Update or add the new codebase
+                existing_doc.add_or_update_codebase(new_doc.codebases[0])
+                final_content = existing_doc.to_string()
+            else:
+                final_content = new_content
         else:
             final_content = new_content
-    else:
-        final_content = new_content
 
-    # Print statistics
-    print_stats(final_content, args.directory_only, traverser.large_files)
+        # Print statistics
+        print_stats(
+            final_content,
+            args.directory_only,
+            traverser.large_files,
+            traverser.has_token_errors,
+            traverser.files_with_token_errors
+        )
 
-    # Update clipboard
-    pyperclip.copy(final_content)
+        # Update clipboard
+        pyperclip.copy(final_content)
 
 
 if __name__ == "__main__":

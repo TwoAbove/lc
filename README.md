@@ -1,7 +1,8 @@
 # lc
-A CLI tool that generates snapshots of codebases for use with Large Language Models (LLMs), featuring multi-codebase support, token management, and clipboard integration.
 
-lc creates a structured XML-like document containing your codebase's files and directories, making it easy to share code context with AI assistants while respecting `.gitignore` patterns and handling multiple codebases.
+A CLI tool to accelerate LLM usage by copying codebase snapshots (`lc`) or generating commands from prompts (`lc -e`). Additional QoL features planned as I find the uses for them.
+
+lc creates a structured XML-like document of codebases for LLMs, respecting .gitignore and supporting multiple codebases.
 
 ## Features
 
@@ -11,6 +12,7 @@ lc creates a structured XML-like document containing your codebase's files and d
 - 📋 Automatic clipboard integration
 - 🛡️ Binary file detection and handling
 - 💾 Preserves existing codebase contexts in clipboard
+- 🖥️ Command generation with `lc -e`
 
 ## Prerequisites
 
@@ -22,6 +24,7 @@ lc creates a structured XML-like document containing your codebase's files and d
   - colorama
   - tiktoken
   - pathspec
+  - openai
 
 ## Installation
 
@@ -72,6 +75,9 @@ lc -d
 
 # Set custom token limit warning
 lc -t 5000
+
+# Generate command from prompt
+lc -e "list all python files"
 ```
 
 ### Output Format
@@ -108,7 +114,7 @@ The tool preserves existing context in your clipboard, allowing you to build up 
 
 3. **Directory Structure**
    - Use directory-only mode (`-d`) for initial exploration of large codebases
-   - Helps manage token usage while maintaining structural context
+   - Helps manage token usage while providing structural context
 
 ### Gotchas and Notes
 
@@ -116,7 +122,7 @@ The tool preserves existing context in your clipboard, allowing you to build up 
    - Automatically detected and marked as `[Binary file]`
    - Common binary extensions are pre-configured
    - If some common binary extensions are missing, please send a PR!
-   - Helps prevent clipboard corruption and saves context
+   - Helps prevent clipboard overuse and saves tokens
 
 2. **Clipboard Behavior**
    - Always reads existing clipboard content
@@ -125,7 +131,7 @@ The tool preserves existing context in your clipboard, allowing you to build up 
 
 3. **File Size**
    - Large files are reported but still included
-   - Consider using `.repoignore` for consistently large files
+   - Consider using `.repoignore` for consistently large files or files that are not useful for LLMs
 
 4. **Git Integration**
    - Automatically finds Git root directory

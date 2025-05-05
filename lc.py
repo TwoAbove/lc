@@ -347,7 +347,11 @@ def parse_ignore_file(file_path: Path) -> Set[str]:
     return ignore_patterns
 
 
-def get_ignore_patterns(base_directory: Path, git_root: Optional[Path]) -> Set[str]:
+def get_ignore_patterns(
+    base_directory: Path,
+    git_root: Optional[Path],
+    additional_ignores: Optional[str] = None,
+) -> Set[str]:
     ignore_patterns = set()
     if git_root:
         ignore_patterns.update(parse_ignore_file(git_root / ".gitignore"))
@@ -359,7 +363,20 @@ def get_ignore_patterns(base_directory: Path, git_root: Optional[Path]) -> Set[s
     # Also add home dir repoignore
     ignore_patterns.update(parse_ignore_file(Path.home() / ".repoignore"))
 
+    # Add default ignores
     ignore_patterns.update({".git", ".repo", "package-lock.json", "yarn.lock"})
+
+    # Add command-line ignore patterns if provided
+    if additional_ignores:
+        # Split by comma and strip whitespace
+        for pattern in additional_ignores.split(","):
+            pattern = pattern.strip()
+            if pattern:
+                # Remove leading slash if present for consistency
+                if pattern.startswith("/"):
+                    pattern = pattern[1:]
+                ignore_patterns.add(pattern)
+
     return ignore_patterns
 
 
@@ -395,11 +412,11 @@ class Config:
 
     @classmethod
     def get_api_key(cls) -> str:
-        return os.getenv("OPENROUTER_API_KEY", "")
+        return os.getenv("LC_OAI_API_KEY", "")
 
     @classmethod
     def get_api_base_url(cls) -> str:
-        return os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        return os.getenv("LC_OAI_BASE_URL", "https://openrouter.ai/api/v1")
 
 
 def get_openai_client() -> openai.OpenAI:
@@ -439,7 +456,7 @@ Output: find . -name "*.jpg" -exec zip images.zip {"{}"} +
         client = get_openai_client()
 
         if not Config.get_api_key():
-            return 'echo "Error: OPENROUTER_API_KEY environment variable not set"'
+            return 'echo "Error: LC_OAI_API_KEY environment variable not set"'
 
         response = client.chat.completions.create(
             model=Config.DEFAULT_MODEL,
@@ -539,6 +556,11 @@ def main():
         default=Config.DEFAULT_TOKEN_LIMIT,
         type=int,
         help="Token limit per file (warns if exceeded)",
+    )
+    parser.add_argument(
+        "-f",
+        "--ignore-filter",
+        help="Additional patterns to ignore (comma-separated, same format as .gitignore)",
     )
     args = parser.parse_args()
 
